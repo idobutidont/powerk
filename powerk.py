@@ -62,7 +62,16 @@ _RANGE_SECONDS = {"1h": 3600, "24h": 86400, "7d": 7 * 86400}
 
 
 def _flag_active(raw: str) -> bool:
-    return raw.strip().lower() not in ("0", "false", "no", "ok", "normal", "")
+    v = raw.strip().lower()
+    if v in (
+        "1", "true", "yes", "on", "overload", "overheat",
+        "warn", "warning", "alert", "error", "alarm", "fault", "high", "active", "trip", "tripped",
+    ):
+        return True
+    try:
+        return int(v) > 0
+    except ValueError:
+        return False
 
 
 def _parse_getinfo_record(g: dict[str, str]) -> dict:
@@ -2144,6 +2153,7 @@ async def _selftest() -> None:
     assert dev.voltage_v == 224.5 and dev.rssi == -52
     assert dev.current_a == 0.02
     assert dev.outlets[1]["config_hex"] == "00000000"
+    assert not _flag_active("off") and not _flag_active("0") and _flag_active("on") and _flag_active("1")
 
     assert await hub.session("aabbccddeeff").set_outlets([2], False, stats=hub.stats, source="selftest") is True
     assert dev.outlets[2]["on"] is False and state_on == set()
