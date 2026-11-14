@@ -65,32 +65,45 @@ def _flag_active(raw: str) -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "ok", "normal", "")
 
 
-def parse_getinfo(line: str) -> list[dict]:
-    """Parse 'up:getinfo:...' into per-outlet records (channel 5 is the aggregate)."""
+def _parse_getinfo_record(g: dict[str, str]) -> dict:
+    ch = int(g["ch"])
+    return {
+        "n": ch,
+        "on": g["relay"].lower() == "on",
+        "power_w": round(int(g["power"]) / 1000.0, 2),
+        "energy_kwh": round(int(g["energy"], 16) / 1000.0, 3),
+        "prev_energy_kwh": round(int(g["previous"], 16) / 1000.0, 3),
+        "temp_c": int(g["temperature"]),
+        "runtime_s": int(g["runtime"]),
+        "overload": _flag_active(g["overload"]),
+        "overheat": _flag_active(g["overheat"]),
+        "state_code": int(g["state"]),
+        "status": g["status"].strip(),
+        "event_hex": g["event"].upper(),
+        "config_hex": g["config"].upper(),
+    }
+
+
+def parse_getinfo_all(line: str) -> tuple[list[dict], dict | None]:
+    """Parse 'up:getinfo:...' into (outlets 1..4, optional channel-5 aggregate)."""
     text = line.strip("\r\n\x00 ")
     if text.startswith("up:getinfo:"):
         text = text[len("up:getinfo:"):]
-    out = []
+    outlets: list[dict] = []
+    aggregate: dict | None = None
     for m in GETINFO_RE.finditer(text):
-        g = m.groupdict()
-        ch = int(g["ch"])
-        if ch > 4:
-            continue
-        out.append({
-            "n": ch,
-            "on": g["relay"].lower() == "on",
-            "power_w": round(int(g["power"]) / 1000.0, 2),
-            "energy_kwh": round(int(g["energy"], 16) / 1000.0, 3),
-            "prev_energy_kwh": round(int(g["previous"], 16) / 1000.0, 3),
-            "temp_c": int(g["temperature"]),
-            "runtime_s": int(g["runtime"]),
-            "overload": _flag_active(g["overload"]),
-            "overheat": _flag_active(g["overheat"]),
-            "state_code": int(g["state"]),
-            "status": g["status"].strip(),
-            "event_hex": g["event"].upper(),
-        })
-    return out
+        rec = _parse_getinfo_record(m.groupdict())
+        if rec["n"] == 5:
+            aggregate = rec
+        elif 1 <= rec["n"] <= 4:
+            outlets.append(rec)
+    return outlets, aggregate
+
+
+def parse_getinfo(line: str) -> list[dict]:
+    """Parse 'up:getinfo:...' into per-outlet records (channel 5 is the aggregate)."""
+    outlets, _ = parse_getinfo_all(line)
+    return outlets
 
 
 class Device:
@@ -107,6 +120,8 @@ class Device:
         self.reconnects = 0
         self.poll_ok = 0
         self.poll_timeouts = 0
+        self.aggregate: dict | None = None
+        self.reported_current_a: dict[int, float] = {}
         self.outlets = {
             n: {
                 "n": n,
@@ -121,6 +136,7 @@ class Device:
                 "state_code": 0,
                 "status": "0",
                 "event_hex": "00",
+                "config_hex": "00000000",
             }
             for n in range(1, 5)
         }
@@ -140,7 +156,9 @@ class Device:
         outlets = []
         for o in self.outlets.values():
             rec = dict(o)
-            rec["current_a"] = round(o["power_w"] / v, 2) if v else 0.0
+            rep_a = self.reported_current_a.get(o["n"])
+            rec["reported_current_a"] = rep_a
+            rec["current_a"] = rep_a if rep_a is not None else (round(o["power_w"] / v, 2) if v else 0.0)
             outlets.append(rec)
         temps = [o["temp_c"] for o in outlets]
         uptime_s = int(max(0.0, time.time() - self.connected_since)) if (self.online and self.connected_since) else 0
@@ -159,8 +177,9 @@ class Device:
             "rssi": self.rssi,
             "avg_temp_c": round(sum(temps) / len(temps), 1) if temps else 0.0,
             "max_temp_c": max(temps) if temps else 0,
-            "overload": any(bool(o.get("overload")) for o in outlets),
-            "overheat": any(bool(o.get("overheat")) for o in outlets),
+            "overload": any(bool(o.get("overload")) for o in outlets) or bool((self.aggregate or {}).get("overload")),
+            "overheat": any(bool(o.get("overheat")) for o in outlets) or bool((self.aggregate or {}).get("overheat")),
+            "aggregate": self.aggregate,
             "last_seen": self.last_seen,
             "connected_since": self.connected_since,
             "uptime_s": uptime_s,
@@ -283,8 +302,24 @@ class StatsStore:
                     event_type TEXT NOT NULL,
                     detail TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE IF NOT EXISTS rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mac TEXT NOT NULL,
+                    outlet INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    target_on INTEGER NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    fire_at REAL,
+                    time_hhmm TEXT,
+                    days_json TEXT NOT NULL DEFAULT '[]',
+                    threshold_w REAL,
+                    idle_s INTEGER,
+                    last_fired TEXT,
+                    created_at REAL NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_events_mac_ts ON events(mac, ts);
                 CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
+                CREATE INDEX IF NOT EXISTS idx_rules_mac ON rules(mac);
             """)
 
     def load_devices(self) -> dict[str, Device]:
@@ -1085,6 +1120,97 @@ class StatsStore:
                     ])
         return buf.getvalue()
 
+    def list_rules(self, mac_filter: str | None = None) -> list[dict]:
+        now = time.time()
+        with self._lock:
+            if mac_filter:
+                rows = self._conn.execute(
+                    "SELECT * FROM rules WHERE mac = ? ORDER BY id DESC", (mac_filter.upper(),)
+                ).fetchall()
+            else:
+                rows = self._conn.execute("SELECT * FROM rules ORDER BY id DESC").fetchall()
+        out = []
+        for r in rows:
+            days = json.loads(r["days_json"] or "[]")
+            rem = max(0, int(round(r["fire_at"] - now))) if r["kind"] == "timer" and r["fire_at"] else None
+            out.append({
+                "id": int(r["id"]),
+                "mac": r["mac"],
+                "outlet": int(r["outlet"]),
+                "kind": r["kind"],
+                "target_on": bool(r["target_on"]),
+                "enabled": bool(r["enabled"]),
+                "fire_at": r["fire_at"],
+                "remaining_s": rem,
+                "time_hhmm": r["time_hhmm"],
+                "days": days,
+                "threshold_w": r["threshold_w"],
+                "idle_s": r["idle_s"],
+                "last_fired": r["last_fired"],
+            })
+        return out
+
+    def add_rule(self, req: dict) -> dict:
+        mac = str(req["mac"]).upper()
+        outlet = int(req.get("outlet", 0))
+        kind = str(req["kind"]).lower()
+        target_on = bool(req.get("target_on", False))
+        now = time.time()
+        if outlet not in (0, 1, 2, 3, 4):
+            raise ValueError("bad outlet")
+        if kind == "timer":
+            delay_s = max(1, int(req["delay_s"]))
+            fire_at = now + delay_s
+            vals = (mac, outlet, "timer", int(target_on), 1, fire_at, None, "[]", None, None, None, now)
+        elif kind == "schedule":
+            hhmm = str(req["time_hhmm"]).strip()
+            if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", hhmm):
+                raise ValueError("time_hhmm must be HH:MM")
+            days = [int(d) for d in req.get("days", []) if 0 <= int(d) <= 6]
+            vals = (mac, outlet, "schedule", int(target_on), 1, None, hhmm, json.dumps(sorted(set(days))), None, None, None, now)
+        elif kind == "standby":
+            if outlet == 0:
+                raise ValueError("standby auto-off applies to outlets 1-4")
+            threshold_w = max(0.0, float(req.get("threshold_w", 2.0)))
+            idle_s = max(10, int(req.get("idle_s", 300)))
+            vals = (mac, outlet, "standby", 0, 1, None, None, "[]", threshold_w, idle_s, None, now)
+        else:
+            raise ValueError("bad rule kind")
+
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO rules (
+                    mac, outlet, kind, target_on, enabled, fire_at, time_hhmm,
+                    days_json, threshold_w, idle_s, last_fired, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                vals,
+            )
+            rule_id = cur.lastrowid
+        return next(r for r in self.list_rules(mac) if r["id"] == rule_id)
+
+    def toggle_rule(self, rule_id: int, enabled: bool) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute("UPDATE rules SET enabled = ? WHERE id = ?", (int(bool(enabled)), int(rule_id)))
+            return cur.rowcount > 0
+
+    def delete_rule(self, rule_id: int) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute("DELETE FROM rules WHERE id = ?", (int(rule_id),))
+            return cur.rowcount > 0
+
+    def mark_rule_fired(self, rule_id: int, last_fired: str, disable: bool = False) -> None:
+        with self._lock, self._conn:
+            if disable:
+                self._conn.execute(
+                    "UPDATE rules SET enabled = 0, last_fired = ? WHERE id = ?", (last_fired, int(rule_id))
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE rules SET last_fired = ? WHERE id = ?", (last_fired, int(rule_id))
+                )
+
     def close(self) -> None:
         with self._lock:
             self._flush_locked()
@@ -1151,6 +1277,7 @@ class Hub:
         self.stats = StatsStore(db_path=db_path, retention_days=retention_days, poll_seconds=self.poll_seconds)
         self.devices: dict[str, Device] = self.stats.load_devices()
         self.sessions: dict[str, Session] = {}
+        self._standby_since: dict[tuple[str, int], float] = {}
 
     def session(self, mac: str) -> Session | None:
         s = self.sessions.get(mac.upper())
@@ -1219,10 +1346,11 @@ class Hub:
                     continue
 
                 if line.startswith("up:getinfo:"):
-                    records = parse_getinfo(line)
+                    records, aggregate = parse_getinfo_all(line)
                     if len(records) == 4:
                         now = time.time()
                         s.device.outlets = {r["n"]: r for r in records}
+                        s.device.aggregate = aggregate
                         s.device.last_seen = now
                         s.device.poll_ok += 1
                         self.stats.record_sample(s.device, now=now)
@@ -1231,8 +1359,12 @@ class Hub:
 
                 if line.lower().startswith("up:power_report:"):
                     m = POWER_REPORT_RE.fullmatch(line)
-                    if m and int(m.group(2)) >= 50000:      # mV -> V; sub-50000 values are per-outlet current, unused
-                        s.device.voltage_v = round(int(m.group(2)) / 1000.0, 1)
+                    if m:
+                        ch, val = int(m.group(1)), int(m.group(2))
+                        if val >= 50000:                     # mV -> V
+                            s.device.voltage_v = round(val / 1000.0, 1)
+                        elif 1 <= ch <= 5 and val >= 0:      # sub-50000 -> mA
+                            s.device.reported_current_a[ch] = round(val / 1000.0, 3)
                     continue
 
                 m = QUERY_RE.fullmatch(line)
@@ -1243,7 +1375,13 @@ class Hub:
                 m = EVENT_RE.fullmatch(line)
                 if m:
                     ch, on = int(m.group(1)), m.group(2).lower() == "on"
-                    if ch:
+                    if ch == 0:
+                        for idx in range(1, 5):
+                            s.device.outlets[idx]["on"] = on
+                            self.stats.sync_outlet_state(s.device.mac, idx, on)
+                        self.stats.record_event(s.device.mac, 0, "on" if on else "off", "master button")
+                        asyncio.create_task(s.refresh())
+                    elif 1 <= ch <= 4:
                         prev_on = bool(s.device.outlets[ch]["on"])
                         s.device.outlets[ch]["on"] = on
                         if prev_on != on:
@@ -1285,6 +1423,40 @@ class Hub:
         except Exception as err:
             print(f"[device] poll error: {err!r}")
 
+    async def _evaluate_rules(self, now: float) -> None:
+        dt_now = datetime.fromtimestamp(now)
+        hhmm = dt_now.strftime("%H:%M")
+        minute_key = dt_now.strftime("%Y-%m-%d %H:%M")
+        weekday = dt_now.weekday()
+        for rule in self.stats.list_rules():
+            if not rule["enabled"]:
+                continue
+            mac = rule["mac"]
+            s = self.session(mac)
+            if not s or not s.device:
+                continue
+            channels = [1, 2, 3, 4] if rule["outlet"] == 0 else [rule["outlet"]]
+            kind = rule["kind"]
+            if kind == "timer" and rule["fire_at"] and now >= rule["fire_at"]:
+                self.stats.mark_rule_fired(rule["id"], minute_key, disable=True)
+                await s.set_outlets(channels, rule["target_on"], stats=self.stats, source="timer")
+            elif kind == "schedule":
+                days = rule["days"]
+                if rule["time_hhmm"] == hhmm and (not days or weekday in days) and rule["last_fired"] != minute_key:
+                    self.stats.mark_rule_fired(rule["id"], minute_key, disable=False)
+                    await s.set_outlets(channels, rule["target_on"], stats=self.stats, source="schedule")
+            elif kind == "standby":
+                ch = rule["outlet"]
+                o = s.device.outlets.get(ch)
+                if o and o["on"] and o["power_w"] <= float(rule["threshold_w"] or 0.0):
+                    since = self._standby_since.setdefault((mac, ch), now)
+                    if (now - since) >= float(rule["idle_s"] or 300):
+                        self._standby_since.pop((mac, ch), None)
+                        self.stats.mark_rule_fired(rule["id"], dt_now.isoformat(timespec="seconds"), disable=False)
+                        await s.set_outlets([ch], False, stats=self.stats, source="standby")
+                else:
+                    self._standby_since.pop((mac, ch), None)
+
     async def poll_loop(self) -> None:
         n = 0
         while True:
@@ -1298,6 +1470,7 @@ class Hub:
             for d in list(self.devices.values()):
                 if not d.online:
                     self.stats.record_sample(d, now=now)
+            await self._evaluate_rules(now)
             elapsed = time.monotonic() - t0
             await asyncio.sleep(max(0.05, self.poll_seconds - elapsed))
 
@@ -1357,6 +1530,11 @@ th{color:var(--dim);font-weight:600;font-size:12px}
 .ev{display:flex;justify-content:space-between;gap:10px;padding:4px 0;border-bottom:1px solid #1d222b}
 .ev:last-child{border-bottom:0}
 .muted{color:var(--dim)}
+.form-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+.ctrl{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:7px 9px;font:inherit;font-size:13px}
+.btn-sm{width:auto;padding:7px 12px;border-radius:8px;font-size:13px;font-weight:600;background:var(--acc);color:#06131c}
+.btn-ghost{width:auto;padding:5px 9px;border-radius:8px;font-size:12px;background:var(--card2);color:var(--fg)}
+.rule{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 10px;background:var(--card2);border-radius:10px;margin-top:6px;font-size:13px;flex-wrap:wrap}
 </style>
 <div class=top>
   <h1>powerk</h1>
@@ -1364,6 +1542,7 @@ th{color:var(--dim);font-weight:600;font-size:12px}
 </div>
 <div style="height:12px"></div>
 <div id=app></div>
+<div id=rules-app></div>
 <div id=stats-app></div>
 <script>
 const tok = new URLSearchParams(location.search).get('t') || '';
@@ -1408,6 +1587,7 @@ function renderState(s) {
       ${d.voltage ? `<span>${d.voltage} V · ${d.current_a} A</span>` : ''}
       <span>Temp: ${d.avg_temp_c ?? 0}°C (max ${d.max_temp_c ?? 0}°C)</span>
       ${d.rssi !== null && d.rssi !== undefined ? `<span>Wi-Fi: ${d.rssi} dBm</span>` : ''}
+      ${d.aggregate ? `<span>Ch5 agg: ${d.aggregate.power_w} W · ${d.aggregate.energy_kwh} kWh · ${d.aggregate.temp_c}°C</span>` : ''}
       <span>fw ${esc(d.fw)}</span>
     </div>
     <div class=grid>${d.outlets.map(o => `
@@ -1415,6 +1595,7 @@ function renderState(s) {
         Outlet ${o.n} · ${o.on ? 'ON' : 'OFF'}
         <small>${o.power_w} W · ${o.current_a ?? 0} A · ${o.temp_c}°C</small>
         <small>Today: ${o.today_kwh ?? 0} kWh (${fmtDur(o.today_on_s ?? 0)})</small>
+        ${o.config_hex && o.config_hex !== '00000000' ? `<small>cfg ${esc(o.config_hex)}</small>` : ''}
         ${o.overload || o.overheat ? `<small style="color:#ffdfba">${o.overload ? 'OVERLOAD ' : ''}${o.overheat ? 'OVERHEAT' : ''}</small>` : ''}
       </button>`).join('')}
     </div>
@@ -1553,12 +1734,96 @@ function renderStats(data) {
   }).join('');
 }
 
+let lastRules = {rules: []};
+async function addRule(mac) {
+  const kind = document.getElementById('r-kind-' + mac).value;
+  const outlet = Number(document.getElementById('r-out-' + mac).value);
+  const target_on = document.getElementById('r-act-' + mac).value === '1';
+  const body = {action:'add', mac, outlet, kind, target_on};
+  if (kind === 'timer') body.delay_s = Math.max(1, Math.round(Number(document.getElementById('r-min-' + mac).value || 15) * 60));
+  if (kind === 'schedule') body.time_hhmm = document.getElementById('r-hhmm-' + mac).value || '22:00';
+  if (kind === 'standby') {
+    body.threshold_w = Number(document.getElementById('r-watt-' + mac).value || 2);
+    body.idle_s = Math.max(10, Math.round(Number(document.getElementById('r-idle-' + mac).value || 5) * 60));
+  }
+  await api('api/rules', body);
+  refreshRules(true);
+}
+async function toggleRule(id, enabled) { await api('api/rules', {action:'toggle', id, enabled}); refreshRules(true); }
+async function delRule(id) { await api('api/rules', {action:'delete', id}); refreshRules(true); }
+function onRuleKindChange(mac) {
+  const k = document.getElementById('r-kind-' + mac).value;
+  document.getElementById('r-timer-box-' + mac).style.display = k === 'timer' ? 'inline-flex' : 'none';
+  document.getElementById('r-sched-box-' + mac).style.display = k === 'schedule' ? 'inline-flex' : 'none';
+  document.getElementById('r-standby-box-' + mac).style.display = k === 'standby' ? 'inline-flex' : 'none';
+  document.getElementById('r-act-' + mac).style.display = k === 'standby' ? 'none' : 'inline-block';
+}
+function renderRules() {
+  const devs = (lastState && lastState.devices) || [];
+  if (!devs.length) { document.getElementById('rules-app').innerHTML = ''; return; }
+  const rules = lastRules.rules || [];
+  document.getElementById('rules-app').innerHTML = devs.map(d => {
+    const dr = rules.filter(r => r.mac === d.mac);
+    const ruleDesc = r => {
+      const target = r.outlet ? 'Outlet ' + r.outlet : 'All Outlets';
+      if (r.kind === 'timer') return `${target} → ${r.target_on ? 'ON' : 'OFF'} in ${r.enabled ? fmtDur(r.remaining_s ?? 0) : 'done'}`;
+      if (r.kind === 'schedule') return `${target} → ${r.target_on ? 'ON' : 'OFF'} daily at ${esc(r.time_hhmm)}`;
+      return `${target} → auto OFF below ${r.threshold_w} W for ${fmtDur(r.idle_s)}`;
+    };
+    return `
+    <div class=card>
+      <h2>${esc(d.name)} · Timers, Schedules & Standby Auto-Off</h2>
+      <div class=form-row>
+        <select class=ctrl id="r-kind-${esc(d.mac)}" onchange="onRuleKindChange('${esc(d.mac)}')">
+          <option value=timer>Countdown Timer</option>
+          <option value=schedule>Daily Schedule</option>
+          <option value=standby>Standby Auto-Off</option>
+        </select>
+        <select class=ctrl id="r-out-${esc(d.mac)}">
+          <option value=1>Outlet 1</option><option value=2>Outlet 2</option>
+          <option value=3>Outlet 3</option><option value=4>Outlet 4</option>
+          <option value=0>All Outlets</option>
+        </select>
+        <select class=ctrl id="r-act-${esc(d.mac)}"><option value=0>Turn OFF</option><option value=1>Turn ON</option></select>
+        <span id="r-timer-box-${esc(d.mac)}" style="display:inline-flex;gap:6px;align-items:center">
+          after <input class=ctrl id="r-min-${esc(d.mac)}" type=number min=1 step=1 value=15 style="width:74px"> min
+        </span>
+        <span id="r-sched-box-${esc(d.mac)}" style="display:none;gap:6px;align-items:center">
+          at <input class=ctrl id="r-hhmm-${esc(d.mac)}" type=time value="23:00">
+        </span>
+        <span id="r-standby-box-${esc(d.mac)}" style="display:none;gap:6px;align-items:center">
+          ≤ <input class=ctrl id="r-watt-${esc(d.mac)}" type=number min=0 step=0.5 value=2 style="width:68px"> W for
+          <input class=ctrl id="r-idle-${esc(d.mac)}" type=number min=1 step=1 value=5 style="width:68px"> min
+        </span>
+        <button class=btn-sm onclick="addRule('${esc(d.mac)}')">Add Rule</button>
+      </div>
+      ${dr.length ? dr.map(r => `
+        <div class=rule style="${r.enabled ? '' : 'opacity:.55'}">
+          <span><b>${esc(r.kind.toUpperCase())}</b> · ${ruleDesc(r)}${r.last_fired ? ` <span class=muted>(last ${esc(r.last_fired)})</span>` : ''}</span>
+          <span style="display:flex;gap:6px">
+            <button class=btn-ghost onclick="toggleRule(${r.id},${!r.enabled})">${r.enabled ? 'Pause' : 'Enable'}</button>
+            <button class=btn-ghost onclick="delRule(${r.id})">Delete</button>
+          </span>
+        </div>`).join('') : '<div class=muted style="font-size:13px">No timers, schedules, or standby rules configured.</div>'}
+    </div>`;
+  }).join('');
+}
+
 async function refreshState() { try { renderState(await api('api/state')); } catch(e) {} }
 async function refreshStats() { try { renderStats(await api(`api/stats?range=${curRange}`)); } catch(e) {} }
+async function refreshRules(force) {
+  try {
+    lastRules = await api('api/rules');
+    const el = document.getElementById('rules-app');
+    if (force || !el.contains(document.activeElement)) renderRules();
+  } catch(e) {}
+}
 refreshState();
 refreshStats();
+refreshRules(true);
 setInterval(refreshState, 1000);
 setInterval(refreshStats, 5000);
+setInterval(() => refreshRules(false), 5000);
 </script>
 """
 
@@ -1624,6 +1889,9 @@ class Web(BaseHTTPRequestHandler):
             range_name = qs.get("range", ["24h"])[0]
             mac = qs.get("mac", [None])[0]
             self._json(self.hub.stats.query_stats(self.hub.devices, range_name=range_name, mac_filter=mac))
+        elif path == "/api/rules":
+            mac = qs.get("mac", [None])[0]
+            self._json({"rules": self.hub.stats.list_rules(mac_filter=mac)})
         elif path == "/api/stats.csv":
             range_name = qs.get("range", ["7d"])[0]
             mac = qs.get("mac", [None])[0]
@@ -1665,14 +1933,38 @@ class Web(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
     def do_POST(self):
-        if not urlparse(self.path).path.startswith("/api/onoff"):
-            self._json({"error": "not found"}, 404)
-            return
+        path = urlparse(self.path).path
         if not self._authorized():
             self._deny()
             return
         try:
             req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        except Exception:
+            self._json({"error": "bad request"}, 400)
+            return
+
+        if path == "/api/rules":
+            action = str(req.get("action", "add")).lower()
+            try:
+                if action == "add":
+                    rule = self.hub.stats.add_rule(req)
+                    self._json({"ok": True, "rule": rule})
+                elif action == "toggle":
+                    ok = self.hub.stats.toggle_rule(int(req["id"]), bool(req["enabled"]))
+                    self._json({"ok": ok})
+                elif action == "delete":
+                    ok = self.hub.stats.delete_rule(int(req["id"]))
+                    self._json({"ok": ok})
+                else:
+                    self._json({"error": "bad action"}, 400)
+            except Exception as err:
+                self._json({"error": str(err)}, 400)
+            return
+
+        if not path.startswith("/api/onoff"):
+            self._json({"error": "not found"}, 404)
+            return
+        try:
             mac = str(req["mac"]).upper()
             outlet = int(req["outlet"])
             on = bool(req["on"])
@@ -1851,11 +2143,16 @@ async def _selftest() -> None:
     assert dev.outlets[2]["runtime_s"] == 222
     assert dev.voltage_v == 224.5 and dev.rssi == -52
     assert dev.current_a == 0.02
+    assert dev.outlets[1]["config_hex"] == "00000000"
 
     assert await hub.session("aabbccddeeff").set_outlets([2], False, stats=hub.stats, source="selftest") is True
     assert dev.outlets[2]["on"] is False and state_on == set()
     snapshot = hub.snapshot()["devices"][0]
     assert snapshot["on"] is False and snapshot["energy_kwh"] == 0.04
+
+    rule = hub.stats.add_rule({"mac": "aabbccddeeff", "outlet": 1, "kind": "timer", "target_on": True, "delay_s": 60})
+    assert len(hub.stats.list_rules("aabbccddeeff")) == 1
+    assert hub.stats.delete_rule(rule["id"]) is True
 
     stats = hub.stats.query_stats(hub.devices, range_name="24h")
     assert stats["retention_days"] == 7
