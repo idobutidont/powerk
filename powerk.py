@@ -62,20 +62,17 @@ _RANGE_SECONDS = {"1h": 3600, "24h": 86400, "7d": 7 * 86400}
 
 
 def _flag_active(raw: str) -> bool:
+    """Return True only for unambiguous fault/trip tokens (not '1'/'on'/numeric thresholds)."""
     v = raw.strip().lower()
-    if v in (
-        "1", "true", "yes", "on", "overload", "overheat",
-        "warn", "warning", "alert", "error", "alarm", "fault", "high", "active", "trip", "tripped",
-    ):
-        return True
-    try:
-        return int(v) > 0
-    except ValueError:
-        return False
+    return v in (
+        "overload", "overheat", "warn", "warning", "alert", "error", "alarm", "fault", "trip", "tripped",
+    )
 
 
 def _parse_getinfo_record(g: dict[str, str]) -> dict:
     ch = int(g["ch"])
+    ov_raw = g["overload"].strip()
+    oh_raw = g["overheat"].strip()
     return {
         "n": ch,
         "on": g["relay"].lower() == "on",
@@ -84,8 +81,10 @@ def _parse_getinfo_record(g: dict[str, str]) -> dict:
         "prev_energy_kwh": round(int(g["previous"], 16) / 1000.0, 3),
         "temp_c": int(g["temperature"]),
         "runtime_s": int(g["runtime"]),
-        "overload": _flag_active(g["overload"]),
-        "overheat": _flag_active(g["overheat"]),
+        "overload": _flag_active(ov_raw),
+        "overheat": _flag_active(oh_raw),
+        "overload_raw": ov_raw,
+        "overheat_raw": oh_raw,
         "state_code": int(g["state"]),
         "status": g["status"].strip(),
         "event_hex": g["event"].upper(),
@@ -131,6 +130,7 @@ class Device:
         self.poll_timeouts = 0
         self.aggregate: dict | None = None
         self.reported_current_a: dict[int, float] = {}
+        self._logged_raw_getinfo = False
         self.outlets = {
             n: {
                 "n": n,
@@ -142,6 +142,8 @@ class Device:
                 "runtime_s": 0,
                 "overload": False,
                 "overheat": False,
+                "overload_raw": "0",
+                "overheat_raw": "0",
                 "state_code": 0,
                 "status": "0",
                 "event_hex": "00",
@@ -350,6 +352,8 @@ class StatsStore:
                     n = int(item["n"])
                     if n in d.outlets:
                         d.outlets[n].update(item)
+                        d.outlets[n]["overload"] = _flag_active(str(d.outlets[n].get("overload_raw", "")))
+                        d.outlets[n]["overheat"] = _flag_active(str(d.outlets[n].get("overheat_raw", "")))
             except Exception:
                 pass
             restored[d.mac] = d
@@ -1358,6 +1362,9 @@ class Hub:
                     records, aggregate = parse_getinfo_all(line)
                     if len(records) == 4:
                         now = time.time()
+                        if not s.device._logged_raw_getinfo:
+                            s.device._logged_raw_getinfo = True
+                            print(f"[device] {s.device.name} sample getinfo: {line}")
                         s.device.outlets = {r["n"]: r for r in records}
                         s.device.aggregate = aggregate
                         s.device.last_seen = now
@@ -2153,7 +2160,8 @@ async def _selftest() -> None:
     assert dev.voltage_v == 224.5 and dev.rssi == -52
     assert dev.current_a == 0.02
     assert dev.outlets[1]["config_hex"] == "00000000"
-    assert not _flag_active("off") and not _flag_active("0") and _flag_active("on") and _flag_active("1")
+    assert not _flag_active("off") and not _flag_active("0") and not _flag_active("1") and not _flag_active("on")
+    assert _flag_active("fault") and _flag_active("trip") and not dev.outlets[1]["overload"]
 
     assert await hub.session("aabbccddeeff").set_outlets([2], False, stats=hub.stats, source="selftest") is True
     assert dev.outlets[2]["on"] is False and state_on == set()
