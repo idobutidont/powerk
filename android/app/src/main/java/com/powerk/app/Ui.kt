@@ -56,6 +56,7 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -110,6 +111,10 @@ import kotlin.math.roundToInt
 fun PowerkApp() {
     var tab by remember { mutableIntStateOf(0) }
     var snapshot by remember { mutableStateOf<Snapshot?>(null) }
+    var stats by remember { mutableStateOf<StatsResponse?>(null) }
+    var statsRange by remember { mutableStateOf("24h") }
+    var statsError by remember { mutableStateOf<String?>(null) }
+    var statsLoading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
     var showSplash by remember { mutableStateOf(true) }
@@ -131,6 +136,18 @@ fun PowerkApp() {
         loading = false
     }
 
+    suspend fun refreshStats(range: String = statsRange) {
+        if (!Server.configured) return
+        statsLoading = true
+        try {
+            stats = Api.stats(Server.base, Server.token, range)
+            statsError = null
+        } catch (e: Exception) {
+            statsError = e.message ?: e.javaClass.simpleName
+        }
+        statsLoading = false
+    }
+
     LaunchedEffect(Unit) {
         delay(1100)
         showSplash = false
@@ -139,7 +156,16 @@ fun PowerkApp() {
     LaunchedEffect(tab, Server.host, Server.port, Server.token) {
         while (true) {
             refresh()
-            delay(2000)
+            delay(1000)
+        }
+    }
+
+    LaunchedEffect(tab, statsRange, Server.host, Server.port, Server.token) {
+        if (tab == 1) {
+            while (true) {
+                refreshStats(statsRange)
+                delay(5000)
+            }
         }
     }
 
@@ -175,6 +201,12 @@ fun PowerkApp() {
                     ShortNavigationBarItem(
                         selected = tab == 1,
                         onClick = { tab = 1 },
+                        icon = { StatsBarIcon() },
+                        label = { Text(stringResource(R.string.tab_stats)) },
+                    )
+                    ShortNavigationBarItem(
+                        selected = tab == 2,
+                        onClick = { tab = 2 },
                         icon = { Icon(Icons.Filled.Settings, contentDescription = null) },
                         label = { Text(stringResource(R.string.tab_settings)) },
                     )
@@ -192,18 +224,26 @@ fun PowerkApp() {
                 label = "tab",
                 modifier = Modifier.fillMaxSize().padding(padding),
             ) { current ->
-                if (current == 0) {
-                    PlugsScreen(
+                when (current) {
+                    0 -> PlugsScreen(
                         snapshot = snapshot,
                         error = error,
                         loading = loading,
                         pending = pending,
                         onRefresh = { scope.launch { refresh() } },
-                        onOpenSettings = { tab = 1 },
+                        onOpenSettings = { tab = 2 },
                         onCommand = { mac, outlet, on -> command(mac, outlet, on) },
                     )
-                } else {
-                    SettingsScreen()
+                    1 -> StatsScreen(
+                        stats = stats,
+                        error = statsError,
+                        loading = statsLoading,
+                        range = statsRange,
+                        onRangeChange = { statsRange = it },
+                        onRefresh = { scope.launch { refreshStats(statsRange) } },
+                        onOpenSettings = { tab = 2 },
+                    )
+                    else -> SettingsScreen()
                 }
             }
         }
@@ -431,11 +471,20 @@ private fun StripCard(
             ) {
                 PowerRing(watts = strip.powerW, enabled = strip.online)
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    MetricPill(stringResource(R.string.today_kwh_pill, strip.todayKwh.toString()))
                     MetricPill("${strip.energyKwh} kWh")
                     strip.voltage?.let { MetricPill("${it.roundToInt()} V") }
                     strip.currentA?.let { MetricPill("$it A") }
+                    if (strip.maxTempC > 0) MetricPill("${strip.maxTempC}°C")
                     strip.rssi?.let { MetricPill("$it dBm") }
                 }
+            }
+
+            if (strip.overload) {
+                MessageCard(stringResource(R.string.safety_overload), isError = true, icon = Icons.Filled.Warning)
+            }
+            if (strip.overheat) {
+                MessageCard(stringResource(R.string.safety_overheat), isError = true, icon = Icons.Filled.Warning)
             }
 
             for (row in 0 until 2) {
@@ -935,5 +984,275 @@ private fun SetupStep(number: Int, text: String) {
             }
         }
         Text(text, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+    }
+}
+
+@Composable
+private fun StatsBarIcon() {
+    val color = LocalContentColor.current
+    Canvas(Modifier.size(20.dp)) {
+        val stroke = 3.dp.toPx()
+        val w = size.width
+        val h = size.height
+        drawLine(color, Offset(w * 0.2f, h * 0.85f), Offset(w * 0.2f, h * 0.50f), strokeWidth = stroke, cap = StrokeCap.Round)
+        drawLine(color, Offset(w * 0.5f, h * 0.85f), Offset(w * 0.5f, h * 0.20f), strokeWidth = stroke, cap = StrokeCap.Round)
+        drawLine(color, Offset(w * 0.8f, h * 0.85f), Offset(w * 0.8f, h * 0.36f), strokeWidth = stroke, cap = StrokeCap.Round)
+    }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun StatsScreen(
+    stats: StatsResponse?,
+    error: String?,
+    loading: Boolean,
+    range: String,
+    onRangeChange: (String) -> Unit,
+    onRefresh: () -> Unit,
+    onOpenSettings: () -> Unit,
+) {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 20.dp, bottom = 36.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        item {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        stringResource(R.string.stats_title),
+                        style = MaterialTheme.typography.headlineMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    if (stats != null) {
+                        Text(
+                            stringResource(R.string.stats_subtitle, stats.retentionDays, stats.pollSeconds.toString()),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                IconButton(onClick = onRefresh, enabled = Server.configured && !loading) {
+                    Icon(Icons.Filled.Refresh, contentDescription = stringResource(R.string.refresh))
+                }
+            }
+        }
+
+        if (!Server.configured) {
+            item {
+                EmptyState(
+                    title = stringResource(R.string.no_server_title),
+                    body = stringResource(R.string.no_server_body),
+                    action = stringResource(R.string.open_settings),
+                    onAction = onOpenSettings,
+                )
+            }
+            return@LazyColumn
+        }
+
+        item {
+            val ranges = listOf(
+                "1h" to stringResource(R.string.stats_range_1h),
+                "24h" to stringResource(R.string.stats_range_24h),
+                "7d" to stringResource(R.string.stats_range_7d),
+            )
+            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                ranges.forEachIndexed { index, (value, label) ->
+                    SegmentedButton(
+                        selected = range == value,
+                        onClick = { onRangeChange(value) },
+                        shape = SegmentedButtonDefaults.itemShape(index = index, count = ranges.size),
+                    ) { Text(label) }
+                }
+            }
+        }
+
+        if (error != null) {
+            item { MessageCard(error, isError = true, icon = Icons.Filled.Warning) }
+        }
+
+        val devices = stats?.devices.orEmpty()
+        if (stats != null && devices.isEmpty()) {
+            item {
+                EmptyState(
+                    title = stringResource(R.string.stats_title),
+                    body = stringResource(R.string.stats_no_data),
+                )
+            }
+        }
+
+        items(devices, key = { it.mac }) { dev ->
+            DeviceStatsSection(dev)
+        }
+    }
+}
+
+@Composable
+private fun DeviceStatsSection(dev: DeviceStats) {
+    val s = dev.summary
+    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        ElevatedCard(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    StatusDot(online = dev.online)
+                    Spacer(Modifier.width(8.dp))
+                    Text(dev.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                }
+                StatsRow(stringResource(R.string.stats_energy), "${s.energyKwh} kWh")
+                StatsRow(stringResource(R.string.stats_power_avg_peak), "${s.avgPowerW} W / ${s.maxPowerW} W")
+                StatsRow(
+                    stringResource(R.string.stats_voltage),
+                    if (s.avgVoltageV != null) "${s.avgVoltageV} V (${s.minVoltageV ?: "-"}–${s.maxVoltageV ?: "-"})" else "-",
+                )
+                StatsRow(stringResource(R.string.stats_current), "${s.avgCurrentA} A (max ${s.maxCurrentA} A)")
+                StatsRow(stringResource(R.string.stats_temperature), "${s.avgTempC}°C (${s.minTempC}–${s.maxTempC}°C)")
+                StatsRow(
+                    stringResource(R.string.stats_rssi),
+                    if (s.avgRssi != null) "${s.avgRssi} dBm (${s.minRssi ?: "-"}..${s.maxRssi ?: "-"})" else "-",
+                )
+                StatsRow(stringResource(R.string.stats_active_time), "${formatDuration(s.onSeconds)} (${s.dutyCyclePct}%)")
+                StatsRow(stringResource(R.string.stats_uptime), "${s.onlinePct}% (${formatDuration(s.onlineSeconds)})")
+            }
+        }
+
+        if (dev.series.isNotEmpty()) {
+            ElevatedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        stringResource(R.string.stats_power_chart),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    PowerTrendChart(dev.series)
+                }
+            }
+        }
+
+        ElevatedCard(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    stringResource(R.string.stats_outlets),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                dev.outlets.forEachIndexed { idx, o ->
+                    if (idx > 0) HorizontalDivider()
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                stringResource(R.string.outlet_n, o.n),
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                "${o.avgPowerW} W avg · ${o.maxPowerW} W peak · ${o.maxTempC}°C max · ${o.toggleCount}x",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("${o.energyKwh} kWh", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
+                            Text(
+                                "${o.sharePct}% · ${formatDuration(o.onSeconds)}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        ElevatedCard(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    stringResource(R.string.stats_daily_7d),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                dev.daily7d.reversed().forEachIndexed { idx, day ->
+                    if (idx > 0) HorizontalDivider()
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(day.date, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Medium)
+                            Text(
+                                "${day.avgPowerW} W avg · ${day.maxPowerW} W peak · ${day.maxTempC}°C · ${day.onlinePct}%",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("${day.energyKwh} kWh", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
+                            Text(
+                                formatDuration(day.onSeconds),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatsRow(label: String, value: String) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+            Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+        }
+    }
+}
+
+@Composable
+private fun PowerTrendChart(series: List<SeriesPoint>) {
+    val primary = MaterialTheme.colorScheme.primary
+    val tertiary = MaterialTheme.colorScheme.tertiary
+    val grid = MaterialTheme.colorScheme.outlineVariant
+    val maxW = (series.maxOfOrNull { maxOf(it.maxPowerW, it.avgPowerW) } ?: 10.0).coerceAtLeast(10.0)
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Canvas(Modifier.fillMaxWidth().height(130.dp)) {
+            val w = size.width
+            val h = size.height
+            drawLine(grid, Offset(0f, h), Offset(w, h), strokeWidth = 1.dp.toPx())
+            drawLine(grid, Offset(0f, h / 2f), Offset(w, h / 2f), strokeWidth = 0.5.dp.toPx())
+            if (series.size == 1) {
+                val y = h * (1f - (series[0].avgPowerW / maxW).toFloat().coerceIn(0f, 1f))
+                drawCircle(primary, radius = 4.dp.toPx(), center = Offset(w / 2f, y))
+            } else {
+                val step = w / (series.size - 1).coerceAtLeast(1)
+                for (i in 0 until series.size - 1) {
+                    val x1 = i * step
+                    val x2 = (i + 1) * step
+                    val y1Avg = h * (1f - (series[i].avgPowerW / maxW).toFloat().coerceIn(0f, 1f))
+                    val y2Avg = h * (1f - (series[i + 1].avgPowerW / maxW).toFloat().coerceIn(0f, 1f))
+                    val y1Max = h * (1f - (series[i].maxPowerW / maxW).toFloat().coerceIn(0f, 1f))
+                    val y2Max = h * (1f - (series[i + 1].maxPowerW / maxW).toFloat().coerceIn(0f, 1f))
+                    drawLine(tertiary.copy(alpha = 0.45f), Offset(x1, y1Max), Offset(x2, y2Max), strokeWidth = 1.5.dp.toPx())
+                    drawLine(primary, Offset(x1, y1Avg), Offset(x2, y2Avg), strokeWidth = 2.5.dp.toPx(), cap = StrokeCap.Round)
+                }
+            }
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("0 W", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("max ${maxW.roundToInt()} W", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+private fun formatDuration(seconds: Int): String {
+    val s = seconds.coerceAtLeast(0)
+    val d = s / 86400
+    val h = (s % 86400) / 3600
+    val m = (s % 3600) / 60
+    val sec = s % 60
+    return when {
+        d > 0 -> "${d}d ${h}h"
+        h > 0 -> "${h}h ${m}m"
+        m > 0 -> "${m}m ${sec}s"
+        else -> "${sec}s"
     }
 }

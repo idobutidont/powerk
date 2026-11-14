@@ -3,6 +3,7 @@
     <string name="app_name">powerk</string>
 
     <string name="tab_plugs">الفيش</string>
+    <string name="tab_stats">الإحصائيات</string>
     <string name="tab_settings">الإعدادات</string>
     <string name="splash_tagline">تحكم في الكهربا من عندك</string>
 
@@ -57,4 +58,25 @@
     <string name="setup_step_3">وجّه المشترك للجهاز ده مرة واحدة:</string>
     <string name="setup_step_4">كده خلصنا — المشترك هيتصل لوحده. مش محتاج تغيّر DNS الراوتر ولا تفتح أي منافذ.</string>
     <string name="setup_footer">تطبيق الأندرويد بيستخدم نفس واجهة JSON اللي بتستخدمها واجهة الويب.</string>
+
+    <string name="stats_title">الإحصائيات</string>
+    <string name="stats_subtitle">سجل %1$d أيام · تحديث كل %2$s ث</string>
+    <string name="stats_range_1h">ساعة</string>
+    <string name="stats_range_24h">24 ساعة</string>
+    <string name="stats_range_7d">7 أيام</string>
+    <string name="stats_energy">الطاقة</string>
+    <string name="stats_power_avg_peak">المتوسط / الذروة</string>
+    <string name="stats_voltage">الجهد</string>
+    <string name="stats_current">التيار</string>
+    <string name="stats_temperature">الحرارة</string>
+    <string name="stats_rssi">إشارة الواي فاي</string>
+    <string name="stats_active_time">وقت التشغيل</string>
+    <string name="stats_uptime">وقت الاتصال</string>
+    <string name="stats_power_chart">مخطط الطاقة (وات)</string>
+    <string name="stats_outlets">تفاصيل كل فيشة</string>
+    <string name="stats_daily_7d">سجل آخر 7 أيام</string>
+    <string name="stats_no_data">مفيش إحصائيات متسجلة لسه.</string>
+    <string name="today_kwh_pill">اليوم %1$s ك.و.س</string>
+    <string name="safety_overload">تحذير: حمل زائد</string>
+    <string name="safety_overheat">تحذير: حرارة عالية</string>
 </resources>

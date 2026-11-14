@@ -4,6 +4,9 @@
 __pycache__/
 *.py[cod]
 *.log
+*.db
+*.db-wal
+*.db-shm
 
 # ---- secrets ----
 # tokens / passwords / local credentials (pass them on the command line instead)
